@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 3.22.1)
 set(prefix "@CMAKE_CURRENT_BINARY_DIR@/test-install")
 file(REMOVE_RECURSE "${prefix}")
 execute_process(COMMAND "@CMAKE_COMMAND@" --install "@CMAKE_CURRENT_BINARY_DIR@"
