@@ -29,3 +29,24 @@ extern "C" int topenapi_validate_request(const cJSON *request, const cJSON *oper
                                        char *error, size_t capacity) {
     return validate(request, operation, error, capacity, true);
 }
+
+extern "C" int topenapi_prepare_request(const cJSON *request, const cJSON *operation,
+                                       cJSON **output, char *error, size_t capacity) {
+    if (error && capacity) error[0] = '\0';
+    if (!output) {
+        if (error && capacity) std::snprintf(error, capacity, "output pointer is required");
+        return 0;
+    }
+    *output = nullptr;
+    try {
+        std::string message;
+        *output = topenapi::prepare_request(const_cast<cJSON *>(request), const_cast<cJSON *>(operation), message);
+        if (error && capacity) std::snprintf(error, capacity, "%s", message.c_str());
+        return *output != nullptr;
+    } catch (const std::exception &e) {
+        if (error && capacity) std::snprintf(error, capacity, "binding preparation failed: %s", e.what());
+    } catch (...) {
+        if (error && capacity) std::snprintf(error, capacity, "binding preparation failed");
+    }
+    return 0;
+}

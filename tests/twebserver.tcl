@@ -1,6 +1,6 @@
 # Optional integration test against an installed twebserver (no listening socket).
 package require twebserver 1.47.54
-package require topenapi 0.1.0
+package require topenapi 0.2.0
 set body "--example\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nReport\r\n--example\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"report.txt\"\r\nContent-Type: text/plain\r\n\r\nabc\r\n--example--\r\n"
 set request [dict create httpMethod POST headers {content-type {multipart/form-data; boundary=example}} \
     multipartBoundary example body [binary encode base64 $body] isBase64Encoded 1]
@@ -10,6 +10,10 @@ set file [lindex [dict get [topenapi::files $normalized] attachment] 0]
 if {[dict get $file filename] ne "report.txt" || [dict get $file size] != 3} {error "incorrect file metadata: $file"}
 if {[dict get $parsed files [dict get $file source_key]] ne "YWJj"} {error "incorrect source lookup"}
 if {[string first YWJj $normalized] >= 0 || [string first Content-Disposition $normalized] >= 0} {error "copied upload payload"}
+set validator [topenapi::compile {{"requestBody":{"content":{"multipart/form-data":{"schema":{"properties":{"attachment":{"type":"string","format":"binary"}}}}}}}}]
+$validator bind $normalized {upload {files attachment 0} title {form title}}
+if {[dict get $upload size] != 3 || $title ne "Report"} {error "incorrect multipart binding"}
+$validator destroy
 set request {httpMethod POST headers {content-type application/x-www-form-urlencoded} body {count=3&tag=red&tag=blue}}
 set normalized [topenapi::from_twebserver $request [twebserver::get_form $request]]
 if {![dict get [topenapi::validate_request $normalized {{"requestBody":{"content":{"application/x-www-form-urlencoded":{"schema":{"properties":{"count":{"type":"integer"},"tag":{"type":"array","minItems":2}}}}}}}}] valid]} {error "form validation failed"}

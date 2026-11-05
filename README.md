@@ -40,7 +40,7 @@ Validation inputs are **JSON text**, preserving JSON types without guessing
 whether a Tcl string represents an object, list, number or boolean.
 
 ```tcl
-package require topenapi 0.1.0
+package require topenapi 0.2.0
 set operation {{"parameters":[
   {"name":"id","in":"path","required":true,
    "schema":{"type":"integer","minimum":1}}
@@ -60,6 +60,7 @@ $validator destroy
 | `topenapi::validate_request requestJson operationJson` | Same validation result |
 | `topenapi::compile operationJson` | Command holding a parsed operation |
 | `$validator validate requestJson` | Validation result, reusing the operation |
+| `$validator bind requestJson mapping` | Validates, converts and assigns selected caller variables; returns empty |
 | `$validator destroy` | Deletes the command and frees its operation |
 | `topenapi::from_twebserver requestDict ?parsedFormDict?` | Normalized request JSON |
 | `topenapi::files requestJson` | Tcl dict mapping field names to lists of metadata dicts |
@@ -70,6 +71,66 @@ usage errors raise Tcl errors. Package-specific errors start with `TOPENAPI`.
 `compile` parses and owns an operation object; it does not perform full OpenAPI
 metaschema validation. Schema constraints are checked during validation.
 Commands may be renamed. Interpreter deletion frees their state.
+
+## Bind caller variables
+
+`$validator bind requestJson mapping` combines request validation, typed value
+extraction and local variable assignment. It uses the compiled OpenAPI operation;
+there is no second validation language or dependency on tjv.
+
+```tcl
+set request [topenapi::from_twebserver $requestDict]
+$validator bind $request {
+    user_id {params id}
+    page    {query page}
+    email   {body user email}
+    avatar  {files avatar 0}
+}
+puts "User $user_id, page $page, email $email"
+puts [dict get $avatar filename]
+```
+
+The operation must declare the selected parameters and request body. Each mapping
+entry is a Tcl variable name followed by a Tcl list describing its field path.
+Destinations are caller-scope scalar names matching `[A-Za-z_][A-Za-z0-9_]*`;
+existing scalar values are replaced. Namespace-qualified names and array element
+names are rejected. Source roots are:
+
+| Source | Values |
+| --- | --- |
+| `params`, `query`, `headers`, `cookies` | Present parameters declared in the operation |
+| `body` | Parsed JSON, a text string, or the combined validated form/file object |
+| `form` | Validated and converted ordinary form fields |
+| `files` | Field-name lists of upload metadata, including when a field has one file |
+
+Paths traverse dictionary keys and nonnegative decimal array indexes. Header
+parameter names are case insensitive; other keys are case sensitive. A root
+alone, such as `{body}`, selects the entire value. GET bodies and absent optional
+bodies are unavailable. Undeclared parameters and missing paths are errors;
+`bind` does not guess defaults or retain an old value for a missing selected field.
+Optional null properties treated as absent by validation are omitted. Other JSON
+nulls become empty Tcl values. Objects become dictionaries and arrays become
+lists. Integral numbers in the signed 64-bit range become Tcl wide integers;
+other numbers become doubles. cJSON's existing double-precision limit still
+applies. Booleans become Tcl booleans; strings remain strings unless a parameter
+or form schema requires coercion. JSON body types are preserved.
+
+Array parameters support repeated values and comma-separated strings. JSON
+parameter content is parsed and JSON bodies are parsed once during preparation.
+For unions, a branch accepting the original type takes precedence over coercion;
+otherwise declaration order selects the conversion. Incompatible conversions
+across `allOf` schemas fail explicitly. Binding traversal is limited to 64 levels.
+File bindings expose metadata; the adapter does not copy upload contents.
+
+Validation, conversion, mapping checks and field extraction all finish **before
+any destination is assigned**. These failures leave caller variables unchanged.
+Tcl errors have `TOPENAPI VALIDATION`, `BIND_MAPPING`, `BIND_PATH` or `BIND_VALUE`
+codes where applicable; standard Tcl argument/dictionary errors are propagated.
+Assignments then follow mapping order and use ordinary Tcl variable semantics.
+A write trace error or an existing array destination can stop assignment after
+earlier variables were written; trace side effects are not rolled back. A trace
+may delete or rename the validator safely. The complete runnable example is
+[`examples/bind.tcl`](examples/bind.tcl).
 
 ## Request contract
 
@@ -208,6 +269,14 @@ if (Topenapi_FromTwebserver(interp, request_dict, parsed_form, &normalized) == T
     cJSON_Delete(normalized);
 }
 ```
+
+`topenapi_prepare_request(request, operation, &output, error, capacity)` exposes
+the same validation and conversion stage to C callers. It returns 1 on success
+with a caller-owned cJSON tree (release it with `cJSON_Delete`) or 0 with `output`
+set to NULL. Inputs remain unmodified. The tree contains the binding source maps
+and a `body` member when the operation validates a present body. It contains no
+raw body string. This function also catches C++ exceptions and accepts optional
+bounded error storage. It performs no Tcl variable assignment.
 
 The adapter returns TCL_OK/TCL_ERROR and sets interpreter diagnostics on failure.
 It borrows Tcl objects only for the duration of the call. `parsed_form` may be

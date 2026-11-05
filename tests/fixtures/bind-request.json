@@ -1,0 +1,22 @@
+{
+  "method": "POST",
+  "params": {
+    "id": "042"
+  },
+  "query": {
+    "page": "2",
+    "enabled": "false",
+    "tags": "1,2,3",
+    "ratio": "2.5"
+  },
+  "headers": {
+    "x-trace": "trace-value"
+  },
+  "cookies": {
+    "theme": "dark"
+  },
+  "context": {
+    "content_type": "application/json"
+  },
+  "raw_body": "{\"user\": {\"email\": \"test@example.com\"}, \"empty\": null, \"enabled\": true, \"optional\": null, \"items\": [{\"name\": \"first\"}]}"
+}
