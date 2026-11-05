@@ -9,4 +9,5 @@ int Topenapi_Error(Tcl_Interp *interp, const char *code, const char *message);
 int Topenapi_Get(Tcl_Interp *interp, Tcl_Obj *dict, const char *key, Tcl_Obj **value);
 cJSON *Topenapi_String(Tcl_Interp *interp, Tcl_Obj *value);
 Tcl_Obj *Topenapi_Utf8(const char *text);
+int Topenapi_Bind(Tcl_Interp *interp, cJSON *request, cJSON *operation, Tcl_Obj *mapping);
 #endif

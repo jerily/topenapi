@@ -1,0 +1,103 @@
+{
+  "parameters": [
+    {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    {
+      "name": "page",
+      "in": "query",
+      "required": true,
+      "schema": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    {
+      "name": "enabled",
+      "in": "query",
+      "required": true,
+      "schema": {
+        "type": "boolean"
+      }
+    },
+    {
+      "name": "tags",
+      "in": "query",
+      "required": true,
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        }
+      }
+    },
+    {
+      "name": "ratio",
+      "in": "query",
+      "required": true,
+      "schema": {
+        "type": "number"
+      }
+    },
+    {
+      "name": "X-Trace",
+      "in": "header",
+      "required": true,
+      "schema": {
+        "type": "string"
+      }
+    },
+    {
+      "name": "theme",
+      "in": "cookie",
+      "required": true,
+      "schema": {
+        "type": "string"
+      }
+    }
+  ],
+  "requestBody": {
+    "required": true,
+    "content": {
+      "application/json": {
+        "schema": {
+          "type": "object",
+          "required": [
+            "user",
+            "empty",
+            "enabled"
+          ],
+          "properties": {
+            "user": {
+              "type": "object",
+              "required": [
+                "email"
+              ],
+              "properties": {
+                "email": {
+                  "type": "string"
+                }
+              }
+            },
+            "empty": {
+              "type": "string",
+              "nullable": true
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "optional": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    }
+  }
+}
