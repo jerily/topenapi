@@ -1,5 +1,5 @@
 package require tcltest 2
-package require topenapi 0.1.0
+package require topenapi 0.2.0
 namespace import ::tcltest::test
 proc valid {result} {dict get $result valid}
 
@@ -143,6 +143,8 @@ test body-6 {Bad base64 and missing content types fail deterministically} -body 
         [catch {topenapi::from_twebserver {body A=== isBase64Encoded 1}}] \
         [valid [topenapi::validate_request {{"method":"POST","raw_body":"{}"}} {{"requestBody":{"content":{"application/json":{"schema":{}}}}}}]]
 } -result {1 1 0}
+
+source [file join [file dirname [info script]] bind.test]
 
 set failed $::tcltest::numTests(Failed)
 ::tcltest::cleanupTests

@@ -15,6 +15,12 @@ int topenapi_validate_schema(const struct cJSON *value, const struct cJSON *sche
 int topenapi_validate_request(const struct cJSON *request, const struct cJSON *operation,
                              char *error, size_t capacity);
 
+/* Validate and produce typed parameter maps and a parsed body for binding.
+ * On success *output is caller-owned (cJSON_Delete); on failure it is NULL.
+ * Unspecified parameters and absent/ignored bodies are not exposed. */
+int topenapi_prepare_request(const struct cJSON *request, const struct cJSON *operation,
+                            struct cJSON **output, char *error, size_t capacity);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,172 @@
+set fixture_root [file join [file dirname [info script]] fixtures]
+foreach {variable filename} {bind_operation bind-operation.json bind_request bind-request.json} {
+    set channel [open [file join $fixture_root $filename]]
+    try {set $variable [read $channel]} finally {close $channel}
+}
+set binder [topenapi::compile $bind_operation]
+
+proc bind_locals {validator request} {
+    set result [$validator bind $request {
+        user_id {params id} page {query page} enabled {query enabled}
+        tags {query tags} ratio {query ratio} trace_id {headers X-TRACE}
+        theme {cookies theme} email {body user email} empty {body empty}
+        body_enabled {body enabled} first {body items 0 name}
+    }]
+    list $result $user_id $page $enabled $tags $ratio $trace_id $theme $email $empty $body_enabled $first
+}
+
+test bind-1 {Creates typed local variables across all request sources} -body {
+    bind_locals $binder $bind_request
+} -result {{} 42 2 0 {1 2 3} 2.5 trace-value dark test@example.com {} 1 first}
+
+test bind-2 {Validation failure leaves all destinations untouched} -body {
+    set id original
+    unset -nocomplain newvar
+    set status [catch {$binder bind [string map {042 bad} $bind_request] {
+        id {params id} newvar {query page}
+    }} message options]
+    list $status $id [info exists newvar] [dict get $options -errorcode]
+} -result {1 original 0 {TOPENAPI VALIDATION}}
+
+test bind-3 {Missing paths and malformed mappings are checked before writes} -body {
+    set id original
+    set results {}
+    foreach mapping {
+        {id {params id} missing {body missing}}
+        {id {params id} optional {body optional}}
+        {id {params id} invalid-name {query page}}
+        {id {params id} invalid {body items -1}}
+        {id {params id} invalid {body items 999999999999999999999999}}
+        {id {params id} invalid {body items 2}}
+        {id {params id} invalid {body user email extra}}
+        {id {params id} invalid {unsupported id}}
+        {id {params id} invalid {}}
+        {id}
+    } {
+        lappend results [catch {$binder bind $bind_request $mapping}] $id
+    }
+    lsort -unique $results
+} -result {1 original}
+
+test bind-4 {Optional absent parameters and undeclared parameters cannot be bound} -body {
+    set validator [topenapi::compile {{"parameters":[{"in":"query","name":"optional","schema":{"type":"integer"}}]}}]
+    try {
+        list [catch {$validator bind {{"query":{"other":"value"}}} {value {query other}}}] \
+            [catch {$validator bind {{"query":{}}} {value {query optional}}}]
+    } finally {$validator destroy}
+} -result {1 1}
+
+test bind-5 {Whole parsed bodies and nested array indexes produce Tcl dictionaries and lists} -body {
+    $binder bind $bind_request {body {body} item {body items 00}}
+    list [dict get $body user email] [dict get $item name] [dict exists $body optional]
+} -result {test@example.com first 0}
+
+test bind-6 {Query JSON content is parsed, validated and projected} -body {
+    set validator [topenapi::compile {{"parameters":[{"name":"filter","in":"query","content":{"application/json":{"schema":{"type":"object","properties":{"count":{"type":"integer"}}}}}}]}}]
+    try {
+        $validator bind {{"query":{"filter":"{\"count\":7}"}}} {count {query filter count}}
+        set count
+    } finally {$validator destroy}
+} -result 7
+
+test bind-7 {Form booleans and repeated numeric values become Tcl types} -body {
+    set validator [topenapi::compile {{"requestBody":{"required":true,"content":{"application/x-www-form-urlencoded":{"schema":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"array","items":{"type":"integer"}}}}}}}}}]
+    try {
+        set request [topenapi::from_twebserver {httpMethod POST headers {content-type application/x-www-form-urlencoded} body data} {fields {enabled false count 2} multiValueFields {count {01 02}}}]
+        $validator bind $request {enabled {form enabled} counts {body count} second {form count 1}}
+        list $enabled $counts $second
+    } finally {$validator destroy}
+} -result {0 {1 2} 2}
+
+test bind-8 {Files bind only metadata while multipart form fields remain typed} -body {
+    set validator [topenapi::compile {{"requestBody":{"content":{"multipart/form-data":{"schema":{"type":"object","properties":{"count":{"type":"integer"},"upload":{"type":"string","format":"binary"}}}}}}}}]
+    try {
+        set request [topenapi::from_twebserver {httpMethod POST headers {content-type multipart/form-data} body RAW_FILE_BYTES} {fields {count 03 upload photo.bin} files {photo.bin AQID}}]
+        $validator bind $request {count {form count} upload {files upload 0} merged_upload {body upload}}
+        list $count [dict get $upload filename] [dict get $upload size] [dict get $merged_upload source_key] \
+            [dict exists $upload content_base64] [catch {$validator bind $request {raw {raw_body}}}]
+    } finally {$validator destroy}
+} -result {3 photo.bin 3 photo.bin 0 1}
+
+test bind-9 {allOf, anyOf and type unions have deterministic conversions} -body {
+    set validator [topenapi::compile {{"parameters":[
+        {"name":"count","in":"query","schema":{"allOf":[{"type":"integer"},{"minimum":1}]}},
+        {"name":"code","in":"query","schema":{"anyOf":[{"type":"integer"},{"type":"string"}]}},
+        {"name":"value","in":"query","schema":{"type":["integer","boolean"]}}
+    ]}}]
+    try {
+        $validator bind {{"query":{"count":"003","code":"004","value":"false"}}} {count {query count} code {query code} value {query value}}
+        list $count $code $value
+    } finally {$validator destroy}
+} -result {3 004 0}
+
+test bind-10 {Conflicting allOf coercions cannot silently change selected types} -body {
+    set validator [topenapi::compile {{"parameters":[{"name":"value","in":"query","schema":{"allOf":[{"type":"integer"},{"type":"string"}]}}]}}]
+    try {
+        set value original
+        set status [catch {$validator bind {{"query":{"value":"2"}}} {value {query value}}} message]
+        list $status $value [string match {*conflicting*} $message]
+    } finally {$validator destroy}
+} -result {1 original 1}
+
+test bind-11 {Unicode selectors and data are preserved without script evaluation} -body {
+    set validator [topenapi::compile {{"requestBody":{"content":{"application/json":{"schema":{"type":"object"}}}}}}]
+    try {
+        set request [topenapi::from_twebserver {httpMethod POST headers {content-type application/json} body {{"é":"[error dangerous] café"}}}]
+        $validator bind $request {value {body é}}
+        set value
+    } finally {$validator destroy}
+} -result {[error dangerous] café}
+
+proc delete_binder_trace {validator args} {$validator destroy}
+proc bind_with_delete {operation request} {
+    set validator [topenapi::compile $operation]
+    trace add variable user_id write [list delete_binder_trace $validator]
+    $validator bind $request {user_id {params id} page {query page}}
+    list $user_id $page [llength [info commands $validator]]
+}
+test bind-12 {A write trace can delete the validator without invalidating later assignments} -body {
+    bind_with_delete $bind_operation $bind_request
+} -result {42 2 0}
+
+proc error_binder_trace {args} {error "write denied"}
+proc bind_with_error {validator request} {
+    set first original
+    trace add variable second write error_binder_trace
+    set status [catch {$validator bind $request {first {params id} second {query page} third {query page}}} message]
+    list $status $first [info exists third] [string match {*write denied*} $message]
+}
+test bind-13 {Tcl assignment errors propagate and stop subsequent assignments} -body {
+    bind_with_error $binder $bind_request
+} -result {1 42 0 1}
+
+test bind-14 {Ignored GET bodies and absent optional bodies cannot be selected} -body {
+    set validator [topenapi::compile {{"requestBody":{"content":{"application/json":{"schema":{}}}}}}]
+    try {
+        list [catch {$validator bind {{"method":"GET","context":{"content_type":"application/json"},"raw_body":"{}"}} {body {body}}}] \
+            [catch {$validator bind {{"method":"POST"}} {body {body}}}]
+    } finally {$validator destroy}
+} -result {1 1}
+
+test bind-15 {No destinations still validates and command arity is enforced} -body {
+    list [$binder bind $bind_request {}] \
+        [catch {$binder bind [string map {042 bad} $bind_request] {}}] \
+        [catch {$binder bind $bind_request}] [catch {$binder bind $bind_request {} extra}]
+} -result {{} 1 1 1}
+
+test bind-16 {Text bodies and nested nulls have documented Tcl representations} -body {
+    set text_validator [topenapi::compile {{"requestBody":{"content":{"text/plain":{"schema":{"type":"string"}}}}}}]
+    try {
+        $text_validator bind {{"method":"POST","context":{"content_type":"text/plain"},"raw_body":"hello world"}} {text {body}}
+        $binder bind $bind_request {empty {body empty}}
+        list $text $empty
+    } finally {$text_validator destroy}
+} -result {{hello world} {}}
+
+$binder destroy
+rename bind_locals {}
+rename delete_binder_trace {}
+rename bind_with_delete {}
+rename error_binder_trace {}
+rename bind_with_error {}
+unset binder fixture_root variable filename channel bind_operation bind_request

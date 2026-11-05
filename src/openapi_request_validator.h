@@ -16,4 +16,6 @@ bool validate_request(cJSON *request, cJSON *operation_schema);
 
 bool validate_request(cJSON *request, cJSON *operation_schema, std::string &error_out);
 
+cJSON *prepare_request(cJSON *request, cJSON *operation_schema, std::string &error_out);
+
 }  // namespace topenapi

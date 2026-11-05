@@ -174,23 +174,26 @@ static void delete_validator(ClientData data) {
 }
 
 static int validator_command(ClientData data, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
-    static const char *const commands[] = {"validate", "destroy", NULL};
+    static const char *const commands[] = {"validate", "destroy", "bind", NULL};
     int index;
     if (objc < 2) {
-        Tcl_WrongNumArgs(interp, 1, objv, "validate requestJson | destroy");
+        Tcl_WrongNumArgs(interp, 1, objv, "validate requestJson | bind requestJson mapping | destroy");
         return TCL_ERROR;
     }
     if (Tcl_GetIndexFromObj(interp, objv[1], commands, "subcommand", TCL_EXACT, &index) != TCL_OK)
         return TCL_ERROR;
-    if (objc != (index == 0 ? 3 : 2)) {
-        Tcl_WrongNumArgs(interp, 2, objv, index == 0 ? "requestJson" : "");
+    static const int argument_counts[] = {3, 2, 4};
+    static const char *const arguments[] = {"requestJson", "", "requestJson mapping"};
+    if (objc != argument_counts[index]) {
+        Tcl_WrongNumArgs(interp, 2, objv, arguments[index]);
         return TCL_ERROR;
     }
     Validator *validator = data;
     if (index == 1) return Tcl_DeleteCommandFromToken(interp, validator->token);
     cJSON *request = parse_json(interp, objv[2]);
     if (!request) return TCL_ERROR;
-    int status = validation_result(interp, request, validator->operation, 1);
+    int status = index == 2 ? Topenapi_Bind(interp, request, validator->operation, objv[3])
+                            : validation_result(interp, request, validator->operation, 1);
     cJSON_Delete(request);
     return status;
 }
