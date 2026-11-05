@@ -15,7 +15,10 @@
 namespace topenapi {
 namespace {
 
+using JsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
+
 struct ValidationContext {
+    cJSON *prepared = nullptr;
     bool coerce_strings = false;
     int depth = 0;
     std::string *error = nullptr;
@@ -651,6 +654,159 @@ bool validate_schema(cJSON *value, cJSON *schema, ValidationContext context) {
     return true;
 }
 
+/* Projection happens only after validation succeeds. It reuses the same schema
+ * predicates; it never mutates caller-owned values or guesses Tcl string types. */
+using Schemas = std::vector<cJSON *>;
+
+bool applicable_schemas(cJSON *value, cJSON *schema, ValidationContext context,
+                        Schemas &result, int depth) {
+    if (!schema) return true;
+    if (depth > 64) {
+        set_error(context, "binding schema nesting exceeds depth limit");
+        return false;
+    }
+    result.push_back(schema);
+    cJSON *branch = nullptr;
+    cJSON_ArrayForEach(branch, cJSON_GetObjectItemCaseSensitive(schema, "allOf")) {
+        if (!applicable_schemas(value, branch, context, result, depth + 1)) return false;
+    }
+    for (const char *keyword : {"anyOf", "oneOf"}) {
+        cJSON *branches = cJSON_GetObjectItemCaseSensitive(schema, keyword);
+        if (!branches) continue;
+        cJSON *selected = nullptr;
+        // Prefer a branch accepting the original JSON type over coercion.
+        for (bool coerce : {false, context.coerce_strings}) {
+            cJSON_ArrayForEach(branch, branches) {
+                std::string ignored;
+                ValidationContext probe = context;
+                probe.coerce_strings = coerce;
+                probe.error = &ignored;
+                if (validate_schema(value, branch, probe)) { selected = branch; break; }
+            }
+            if (selected) break;
+        }
+        if (selected && !applicable_schemas(value, selected, context, result, depth + 1)) return false;
+    }
+    return true;
+}
+
+std::string projected_type(cJSON *value, cJSON *schema, const ValidationContext &context) {
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(schema, "type");
+    if (type_is_declared(schema, "string")) return "string";
+    if (cJSON_IsString(type) && value_matches_type(value, type->valuestring, context)) return type->valuestring;
+    cJSON *item = nullptr;
+    cJSON *types = cJSON_IsArray(type) ? type : nullptr;
+    cJSON_ArrayForEach(item, types) {
+        if (cJSON_IsString(item) && value_matches_type(value, item->valuestring, context)) return item->valuestring;
+    }
+    if (!has_declared_type(schema) && cJSON_GetObjectItemCaseSensitive(schema, "items")) return "array";
+    return "";
+}
+
+JsonPtr project_value(cJSON *value, const Schemas &roots, ValidationContext context, int depth = 0) {
+    if (depth > 64) {
+        set_error(context, "binding value nesting exceeds depth limit");
+        return JsonPtr(nullptr, cJSON_Delete);
+    }
+    Schemas schemas;
+    for (cJSON *schema : roots) {
+        if (!applicable_schemas(value, schema, context, schemas, depth)) return JsonPtr(nullptr, cJSON_Delete);
+    }
+    std::string type;
+    if (context.coerce_strings && cJSON_IsString(value)) {
+        for (cJSON *schema : schemas) {
+            const std::string candidate = projected_type(value, schema, context);
+            if (candidate.empty()) continue;
+            if (type.empty() || type == candidate) { type = candidate; continue; }
+            if ((type == "integer" && candidate == "number") || (type == "number" && candidate == "integer")) {
+                type = "integer";
+                continue;
+            }
+            set_error(context, "binding has conflicting schema conversions");
+            return JsonPtr(nullptr, cJSON_Delete);
+        }
+    }
+    JsonPtr converted(nullptr, cJSON_Delete);
+    if (type == "integer" || type == "number") {
+        double number;
+        if (!value_as_number(value, context, number)) return converted;
+        converted.reset(cJSON_CreateNumber(number));
+    } else if (type == "boolean") {
+        bool boolean;
+        if (!value_as_bool(value, context, boolean)) return converted;
+        converted.reset(cJSON_CreateBool(boolean));
+    } else if (type == "array") {
+        converted.reset(cJSON_CreateArray());
+        if (!converted) throw std::bad_alloc();
+        for (const auto &part : split_on_char(value->valuestring, ',')) {
+            JsonPtr item(cJSON_CreateString(part.c_str()), cJSON_Delete);
+            if (!item || !cJSON_AddItemToArray(converted.get(), item.get())) throw std::bad_alloc();
+            item.release();
+        }
+    }
+    if (converted) value = converted.get();
+    else if (type == "integer" || type == "number" || type == "boolean") throw std::bad_alloc();
+
+    if (cJSON_IsObject(value)) {
+        JsonPtr result(cJSON_CreateObject(), cJSON_Delete);
+        if (!result) throw std::bad_alloc();
+        cJSON *property = nullptr;
+        cJSON_ArrayForEach(property, value) {
+            Schemas children;
+            bool optional_null = false, required = false;
+            for (cJSON *schema : schemas) {
+                cJSON *properties = cJSON_GetObjectItemCaseSensitive(schema, "properties");
+                cJSON *required_names = cJSON_GetObjectItemCaseSensitive(schema, "required");
+                required = required || required_property_names_contains(required_names, property->string);
+                optional_null = optional_null || should_treat_object_property_as_missing(property, properties, required_names);
+                cJSON *child = cJSON_GetObjectItemCaseSensitive(properties, property->string);
+                if (!child) child = cJSON_GetObjectItemCaseSensitive(schema, "additionalProperties");
+                if (cJSON_IsObject(child)) children.push_back(child);
+            }
+            if (optional_null && !required) continue;
+            auto child = project_value(property, children, context, depth + 1);
+            if (!child) return JsonPtr(nullptr, cJSON_Delete);
+            if (!cJSON_AddItemToObject(result.get(), property->string, child.get())) throw std::bad_alloc();
+            child.release();
+        }
+        return result;
+    }
+    if (cJSON_IsArray(value)) {
+        Schemas children;
+        for (cJSON *schema : schemas) {
+            cJSON *items = cJSON_GetObjectItemCaseSensitive(schema, "items");
+            if (items) children.push_back(items);
+        }
+        JsonPtr result(cJSON_CreateArray(), cJSON_Delete);
+        if (!result) throw std::bad_alloc();
+        cJSON *item = nullptr;
+        cJSON_ArrayForEach(item, value) {
+            auto child = project_value(item, children, context, depth + 1);
+            if (!child) return JsonPtr(nullptr, cJSON_Delete);
+            if (!cJSON_AddItemToArray(result.get(), child.get())) throw std::bad_alloc();
+            child.release();
+        }
+        return result;
+    }
+    JsonPtr result(cJSON_Duplicate(value, 0), cJSON_Delete);
+    if (!result) throw std::bad_alloc();
+    return result;
+}
+
+bool save_projection(cJSON *target, const char *key, JsonPtr value) {
+    if (!value) return false;
+    cJSON_DeleteItemFromObjectCaseSensitive(target, key);
+    if (!cJSON_AddItemToObject(target, key, value.get())) throw std::bad_alloc();
+    value.release();
+    return true;
+}
+
+bool project_body(cJSON *body, cJSON *media, ValidationContext context) {
+    if (!context.prepared) return true;
+    return save_projection(context.prepared, "body",
+                           project_value(body, {cJSON_GetObjectItemCaseSensitive(media, "schema")}, context));
+}
+
 bool object_has_children(cJSON *object) {
     return cJSON_IsObject(object) && object->child != nullptr;
 }
@@ -703,7 +859,7 @@ cJSON *parse_complete_json(const std::string &text) {
     return cJSON_ParseWithLengthOpts(text.c_str(), text.size() + 1, nullptr, 1);
 }
 
-bool validate_parameter_content(cJSON *value, cJSON *content, ValidationContext context) {
+bool validate_parameter_content(cJSON *value, cJSON *content, ValidationContext context, JsonPtr &projected) {
     if (!cJSON_IsObject(content)) {
         set_error(context, "parameter content must be an object");
         return false;
@@ -718,25 +874,25 @@ bool validate_parameter_content(cJSON *value, cJSON *content, ValidationContext 
         return false;
     }
     cJSON *schema = cJSON_GetObjectItemCaseSensitive(media, "schema");
-    if (schema == nullptr) {
-        return true;
-    }
+    if (schema == nullptr && !context.prepared) return true;
     const std::string media_type = media->string == nullptr ? "" : lowercase_ascii_copy(media->string);
     if ((media_type == "application/json" ||
          (media_type.size() > 5 && media_type.compare(media_type.size() - 5, 5, "+json") == 0)) &&
         cJSON_IsString(value) && value->valuestring != nullptr) {
-        cJSON *parsed = parse_complete_json(value->valuestring);
+        JsonPtr parsed(parse_complete_json(value->valuestring), cJSON_Delete);
         if (parsed == nullptr) {
             set_error(context, "parameter JSON content is invalid");
             return false;
         }
         ValidationContext nested = context;
         nested.coerce_strings = false;
-        const bool valid = validate_schema(parsed, schema, nested);
-        cJSON_Delete(parsed);
-        return valid;
+        if (schema && !validate_schema(parsed.get(), schema, nested)) return false;
+        if (context.prepared) projected = project_value(parsed.get(), {schema}, nested);
+        return !context.prepared || projected != nullptr;
     }
-    return validate_schema(value, schema, context);
+    if (schema && !validate_schema(value, schema, context)) return false;
+    if (context.prepared) projected = project_value(value, {schema}, context);
+    return !context.prepared || projected != nullptr;
 }
 
 bool validate_parameter(cJSON *request, cJSON *parameter, ValidationContext context) {
@@ -777,14 +933,20 @@ bool validate_parameter(cJSON *request, cJSON *parameter, ValidationContext cont
     ValidationContext parameter_context = context;
     parameter_context.coerce_strings = true;
     cJSON *schema = cJSON_GetObjectItemCaseSensitive(parameter, "schema");
-    if (schema != nullptr) {
-        return validate_schema(value, schema, parameter_context);
-    }
     cJSON *content = cJSON_GetObjectItemCaseSensitive(parameter, "content");
-    if (content != nullptr) {
-        return validate_parameter_content(value, content, parameter_context);
+    JsonPtr projected(nullptr, cJSON_Delete);
+    if (schema) {
+        if (!validate_schema(value, schema, parameter_context)) return false;
+        if (context.prepared) projected = project_value(value, {schema}, parameter_context);
+    } else if (content) {
+        if (!validate_parameter_content(value, content, parameter_context, projected)) return false;
+    } else if (context.prepared) {
+        projected = project_value(value, {}, parameter_context);
     }
-    return true;
+    if (!context.prepared) return true;
+    cJSON *target = parameter_location_object(context.prepared, location);
+    const std::string key = location == "header" ? lowercase_ascii_copy(name) : name;
+    return save_projection(target, key.c_str(), std::move(projected));
 }
 
 bool media_type_is_json(const std::string &media_type) {
@@ -820,32 +982,28 @@ bool validate_media_schema(cJSON *media_object, cJSON *body, ValidationContext c
 }
 
 bool validate_json_body(cJSON *media_object, const std::string &raw_body, ValidationContext context) {
-    cJSON *body = parse_complete_json(raw_body);
+    JsonPtr body(parse_complete_json(raw_body), cJSON_Delete);
     if (body == nullptr) {
         set_error(context, "request JSON body is invalid");
         return false;
     }
     ValidationContext json_context = context;
     json_context.coerce_strings = false;
-    const bool valid = validate_media_schema(media_object, body, json_context);
-    cJSON_Delete(body);
-    return valid;
+    return validate_media_schema(media_object, body.get(), json_context) &&
+           project_body(body.get(), media_object, json_context);
 }
 
 bool validate_text_body(cJSON *media_object, const std::string &raw_body, ValidationContext context) {
-    cJSON *body = cJSON_CreateString(raw_body.c_str());
+    JsonPtr body(cJSON_CreateString(raw_body.c_str()), cJSON_Delete);
     if (body == nullptr) {
         set_error(context, "failed to allocate text request body");
         return false;
     }
     ValidationContext text_context = context;
     text_context.coerce_strings = false;
-    const bool valid = validate_media_schema(media_object, body, text_context);
-    cJSON_Delete(body);
-    return valid;
+    return validate_media_schema(media_object, body.get(), text_context) &&
+           project_body(body.get(), media_object, text_context);
 }
-
-using JsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
 
 cJSON *media_schema(cJSON *media_object) {
     return cJSON_IsObject(media_object) ? cJSON_GetObjectItemCaseSensitive(media_object, "schema") : nullptr;
@@ -1075,7 +1233,19 @@ bool validate_multipart_body(cJSON *media_object, cJSON *form, cJSON *files, Val
     ValidationContext form_context = context;
     form_context.uploads = &uploads;
     form_context.coerce_strings = true;
-    return schema == nullptr || validate_schema(body.get(), schema, form_context);
+    if (schema && !validate_schema(body.get(), schema, form_context)) return false;
+    if (!project_body(body.get(), media_object, form_context)) return false;
+    if (context.prepared) {
+        cJSON *projected_body = cJSON_GetObjectItemCaseSensitive(context.prepared, "body");
+        cJSON *projected_form = cJSON_GetObjectItemCaseSensitive(context.prepared, "form");
+        cJSON *field = nullptr;
+        cJSON_ArrayForEach(field, form) {
+            cJSON *value = cJSON_GetObjectItemCaseSensitive(projected_body, field->string);
+            if (value && !save_projection(projected_form, field->string, project_value(value, {}, context))) return false;
+        }
+        if (files && !save_projection(context.prepared, "files", project_value(files, {}, context))) return false;
+    }
+    return true;
 }
 
 std::string request_content_type(cJSON *request) {
@@ -1152,7 +1322,10 @@ bool validate_request_body(cJSON *request, cJSON *request_body, ValidationContex
     if (media_type_is_urlencoded_form(content_type)) {
         ValidationContext form_context = context;
         form_context.coerce_strings = true;
-        return validate_media_schema(media_object, form, form_context);
+        if (!validate_media_schema(media_object, form, form_context) ||
+            !project_body(form, media_object, form_context)) return false;
+        return !context.prepared || save_projection(context.prepared, "form",
+            project_value(cJSON_GetObjectItemCaseSensitive(context.prepared, "body"), {}, context));
     }
 
     if (media_type_is_multipart_form(content_type)) {
@@ -1215,7 +1388,7 @@ bool validate_request(cJSON *request, cJSON *operation_schema) {
     return validate_request(request, operation_schema, error);
 }
 
-bool validate_request(cJSON *request, cJSON *operation_schema, std::string &error_out) {
+static bool validate_request_impl(cJSON *request, cJSON *operation_schema, std::string &error_out, cJSON *prepared) {
     error_out.clear();
     if (!cJSON_IsObject(request)) {
         error_out = "request must be an object";
@@ -1232,6 +1405,7 @@ bool validate_request(cJSON *request, cJSON *operation_schema, std::string &erro
 
     ValidationContext context;
     context.error = &error_out;
+    context.prepared = prepared;
     cJSON *request_body = cJSON_GetObjectItemCaseSensitive(operation_schema, "requestBody");
     if (request_method_is_get(request)) {
         request_body = nullptr;
@@ -1240,6 +1414,20 @@ bool validate_request(cJSON *request, cJSON *operation_schema, std::string &erro
                                cJSON_GetObjectItemCaseSensitive(operation_schema, "parameters"),
                                context) &&
            validate_request_body(request, request_body, context);
+}
+
+bool validate_request(cJSON *request, cJSON *operation_schema, std::string &error_out) {
+    return validate_request_impl(request, operation_schema, error_out, nullptr);
+}
+
+cJSON *prepare_request(cJSON *request, cJSON *operation_schema, std::string &error_out) {
+    JsonPtr result(cJSON_CreateObject(), cJSON_Delete);
+    if (!result) throw std::bad_alloc();
+    for (const char *name : {"params", "query", "headers", "cookies", "form", "files"}) {
+        if (!cJSON_AddObjectToObject(result.get(), name)) throw std::bad_alloc();
+    }
+    if (!validate_request_impl(request, operation_schema, error_out, result.get())) return nullptr;
+    return result.release();
 }
 
 }  // namespace topenapi
