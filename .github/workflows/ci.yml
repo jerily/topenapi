@@ -1,10 +1,17 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -16,7 +23,7 @@ jobs:
       - name: Build Tcl 9.1
         if: matrix.tcl == '9.1'
         run: |
-          curl -fLsS --retry 3 https://prdownloads.sourceforge.net/tcl/tcl9.1.0-src.tar.gz -o tcl.tar.gz
+          curl -fLsS --connect-timeout 30 --max-time 180 --retry 3 https://prdownloads.sourceforge.net/tcl/tcl9.1.0-src.tar.gz -o tcl.tar.gz
           tar -xzf tcl.tar.gz
           cd tcl9.1.0/unix
           ./configure --prefix="$RUNNER_TEMP/tcl"
