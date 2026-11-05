@@ -1,0 +1,42 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tcl: ['8.6', '9.1']
+        shared: ['ON', 'OFF']
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ libcjson-dev tcl8.6-dev
+      - name: Build Tcl 9.1
+        if: matrix.tcl == '9.1'
+        run: |
+          curl -fLsS --retry 3 https://prdownloads.sourceforge.net/tcl/tcl9.1.0-src.tar.gz -o tcl.tar.gz
+          tar -xzf tcl.tar.gz
+          cd tcl9.1.0/unix
+          ./configure --prefix="$RUNNER_TEMP/tcl"
+          make -j2
+          make install
+      - name: Configure
+        env:
+          TCL_VERSION: ${{ matrix.tcl }}
+          SHARED: ${{ matrix.shared }}
+        run: |
+          if [ "$TCL_VERSION" = 9.1 ]; then
+            cmake -S . -B build -DBUILD_SHARED_LIBS="$SHARED" \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/tcl" \
+              -DTCL_INCLUDE_PATH="$RUNNER_TEMP/tcl/include" \
+              -DTCL_STUB_LIBRARY="$RUNNER_TEMP/tcl/lib/libtclstub.a" \
+              -DTCL_TCLSH="$RUNNER_TEMP/tcl/bin/tclsh9.1"
+          else
+            cmake -S . -B build -DBUILD_SHARED_LIBS="$SHARED" \
+              -DCMAKE_BUILD_TYPE=Release -DTCL_INCLUDE_PATH=/usr/include/tcl8.6 \
+              -DTCL_TCLSH=/usr/bin/tclsh8.6
+          fi
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure

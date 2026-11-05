@@ -1,0 +1,2 @@
+if {![package vsatisfies [package provide Tcl] @TOPENAPI_TCL_REQUIREMENT@]} { return }
+package ifneeded topenapi @PROJECT_VERSION@ @TOPENAPI_LOAD@
